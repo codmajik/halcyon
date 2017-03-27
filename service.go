@@ -2,18 +2,17 @@ package halcyon
 
 import (
 	"errors"
+	"fmt"
 	"github.com/Sirupsen/logrus"
 	sr "github.com/codmajik/servicerouter"
 	nats "github.com/nats-io/go-nats"
 	"github.com/nats-io/nuid"
 	"golang.org/x/net/context"
-	"regexp"
 	"strings"
 	"time"
 )
 
-var serviceNameSanitize, _ = regexp.Compile("[^a-zA-Z0-9]")
-var ErrBadInst = errors.New("Halcyon: not instantianted")
+var ErrBadInst = errors.New("Halcyon: not instantiated")
 
 type Handler interface {
 	Init(*sr.Router, *Client) error
@@ -34,8 +33,9 @@ type Halcyon struct {
 func NewHalcyon(srv Handler, opts ...ConfigFn) *Halcyon {
 
 	cfg := &config{
-		NatsUri:            make([]string, 0),
+		NatsURI:            make([]string, 0),
 		NotificationTopics: []string{"system"},
+		ServiceName:        "unknamed-" + nuid.Next(),
 	}
 
 	for _, opt := range opts {
@@ -44,7 +44,7 @@ func NewHalcyon(srv Handler, opts ...ConfigFn) *Halcyon {
 
 	return &Halcyon{
 		conf:        cfg,
-		serviceName: strings.ToLower(serviceNameSanitize.ReplaceAllString(cfg.ServiceName, "")),
+		serviceName: sanitizeServiceName(cfg.ServiceName),
 		service:     srv,
 		done:        make(chan bool),
 		cl:          &Client{},
@@ -55,24 +55,28 @@ func NewHalcyon(srv Handler, opts ...ConfigFn) *Halcyon {
 	}
 }
 
-func (h *Halcyon) connect() {
+func (h *Halcyon) connect() error {
+
+	if h == nil {
+		return ErrBadInst
+	}
+
 	clName := "halcyon.service." + h.serviceName + "-" + nuid.Next()
 	timeout := int64(0)
 	for {
+		if h.conn != nil {
+			break
+		}
+
 		time.Sleep(time.Duration(timeout) * time.Second)
 		conn, err := nats.Connect(
-			strings.Join(h.conf.NatsUri, ","),
-			nats.DisconnectHandler(func(c *nats.Conn) {
-				h.log.Error("disconnected from NATS cluster...trying again!!!")
-			}),
-			nats.ReconnectHandler(func(c *nats.Conn) {
-				h.log.Error("connected to NATS cluster")
-			}),
+			strings.Join(h.conf.NatsURI, ","),
 			nats.Name(clName),
 			nats.MaxReconnects(-1),
 		)
 		if err != nil {
-			h.log.Info("connection attempt failed...trying", err.Error())
+			h.log.WithError(err).
+				Errorf("unable to connect to %s as %s", h.conf.NatsURI, clName)
 
 			if timeout*2 > 20 {
 				timeout = 20
@@ -80,25 +84,43 @@ func (h *Halcyon) connect() {
 				timeout = (timeout * 2) + 1
 			}
 
+			h.log.Info("retrying in ", timeout)
 			continue
 		}
 
 		h.conn = conn
-		h.log.Info("connected to NATS server with ID: ", conn.ConnectedServerId())
-		break
 	}
+
+	h.log.Infof("connected to server [id:%s, uri:%s]", h.conn.ConnectedServerId(), h.conn.ConnectedUrl())
+	h.conn.SetDisconnectHandler(func(c *nats.Conn) {
+		h.log.Error("disconnected from NATS cluster...trying again!!!")
+	})
+
+	h.conn.SetReconnectHandler(func(c *nats.Conn) {
+		h.log.Info("reconnected NATS cluster")
+	})
+	return nil
+}
+
+// NatsConn returns internal nats connection
+func (h *Halcyon) NatsConn() *nats.Conn {
+	return h.conn
 }
 
 func (h *Halcyon) setupSubs() error {
-	prefix := "halcyon." + h.serviceName + ".service"
-	h.log.Info("subscribing for service requests on ", prefix)
+	if h == nil {
+		return ErrBadInst
+	}
+
+	prefix := "halcyon.rpc." + h.serviceName
+	h.log.Info("subscribing for service rpc on ", prefix)
 	_, err := h.conn.QueueSubscribe(prefix+".>", prefix, func(msg *nats.Msg) {
 		res, err := h.router.Exec(context.Background(), msg.Subject, msg.Data)
 		if err != nil {
-			h.log.Error("executing request failed with", err)
-			h.conn.Publish(msg.Reply, []byte(err.Error()))
-			return
+			h.log.WithError(err).Error("request execution fialed")
+			res = []byte(err.Error())
 		}
+
 		if res == nil || msg.Reply == "" {
 			return
 		}
@@ -106,22 +128,22 @@ func (h *Halcyon) setupSubs() error {
 	})
 
 	if err != nil {
-		h.log.Error("Subscripting for request failed")
+		h.log.WithError(err).Error("Subscripting for request failed")
 		return err
 	}
 
 	h.log.Info("subscribing interested notifications")
 	for _, serviceName := range h.conf.NotificationTopics {
-		nprefix := "halcyon." + serviceName + ".notify"
-		h.log.Info("subscribing for notification from", nprefix)
+		nprefix := "halcyon.notify." + serviceName
+		h.log.Info("subscribing for notification from: ", nprefix)
 		_, err := h.conn.Subscribe(nprefix+".>", func(msg *nats.Msg) {
 			sub := strings.TrimPrefix(msg.Subject, "halcyon.")
-			h.log.Info("incomming notification from", sub)
+			h.log.Info("incomming notification from: ", sub)
 			h.service.Notify(context.Background(), sub, msg.Data)
 		})
 
 		if err != nil {
-			h.log.Error("Subscripting for failed", err)
+			h.log.WithError(err).Error("Subscripting for failed")
 			return err
 		}
 	}
@@ -137,11 +159,12 @@ func (h *Halcyon) Run() error {
 
 	h.log.Info("Connecting to configured NATS cluster")
 	h.connect()
+
 	h.cl.cl = h.conn
 
-	h.log.Infof("Initializing Router for halcyon.%s.service", h.serviceName)
+	h.log.Infof("Initializing Router for halcyon.rpc.%s", h.serviceName)
 	h.router = sr.NewRouter(
-		sr.RootPrefix("halcyon."+h.serviceName+".service."),
+		sr.RootPrefix(fmt.Sprintf("halcyon.rpc.%s.", h.serviceName)),
 		sr.RouteCallback(func(path string, route *sr.Route) {
 			h.log.Infof("request '%s' matched to %s", path, route.Name())
 		}),
