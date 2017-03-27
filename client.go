@@ -26,6 +26,11 @@ func (c *Client) Call(serviceName, reqUri string, data []byte) (interface{}, err
 	return msg.Data, nil
 }
 
+// NatsConn returns internal nats connection
+func (c *Client) NatsConn() *nats.Conn {
+	return c.cl
+}
+
 func (c *Client) Notify(serviceName string, data []byte) error {
 	if !c.cl.IsConnected() {
 		if c.cl.IsReconnecting() {

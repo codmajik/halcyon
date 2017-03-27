@@ -102,11 +102,6 @@ func (h *Halcyon) connect() error {
 	return nil
 }
 
-// NatsConn returns internal nats connection
-func (h *Halcyon) NatsConn() *nats.Conn {
-	return h.conn
-}
-
 func (h *Halcyon) setupSubs() error {
 	if h == nil {
 		return ErrBadInst
